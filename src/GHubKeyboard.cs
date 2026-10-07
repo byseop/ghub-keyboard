@@ -25,6 +25,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 [assembly: AssemblyTitle("G Hub Keyboard")]
 [assembly: AssemblyDescription("Trigger Logitech G HUB macros with a keyboard key (unofficial)")]
@@ -34,21 +35,38 @@ using System.Windows.Forms;
 
 static class Program
 {
+    const uint LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x800;
+
+    [DllImport("kernel32.dll")]
+    static extern bool SetDefaultDllDirectories(uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr LoadLibraryEx(string name, IntPtr file, uint flags);
+
     [STAThread]
     static void Main()
     {
-        bool created;
-        using (var mutex = new Mutex(true, "GHubKeyboard_SingleInstance", out created))
+        // 관리자 권한으로 실행되므로, exe 옆에 심어 둔 가짜 DLL이 대신 로드되지 않게
+        // 이후의 DLL 검색을 System32로 제한하고 winsqlite3.dll은 System32에서 미리 로드한다.
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+        LoadLibraryEx("winsqlite3.dll", IntPtr.Zero, LOAD_LIBRARY_SEARCH_SYSTEM32);
+
+        Mutex mutex = null;
+        try
         {
+            bool created;
+            mutex = new Mutex(true, "GHubKeyboard_SingleInstance", out created);
             if (!created)
             {
                 MessageBox.Show("G Hub Keyboard가 이미 실행 중입니다.", "G Hub Keyboard");
                 return;
             }
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
         }
+        catch (UnauthorizedAccessException) { }   // 다른 프로그램이 이름을 선점해 막아도 실행은 한다
+
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        Application.Run(new MainForm());
+        GC.KeepAlive(mutex);
     }
 }
 
@@ -84,21 +102,9 @@ static class GHubSettings
         string source = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LGHUB", "settings.db");
         if (!File.Exists(source)) throw new Exception("G Hub 설정 파일을 찾을 수 없습니다.");
 
-        // G Hub가 파일을 쓰고 있으므로 임시 폴더에 복사해서 읽는다
-        string temp = Path.Combine(Path.GetTempPath(), "GHubKeyboard");
-        Directory.CreateDirectory(temp);
-        string copy = Path.Combine(temp, "settings.db");
-        foreach (var suffix in new[] { "", "-wal", "-shm" })
-        {
-            string dst = copy + suffix;
-            if (File.Exists(dst)) File.Delete(dst);
-            if (!File.Exists(source + suffix)) continue;
-            using (var src = new FileStream(source + suffix, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-            using (var dstStream = File.Create(dst))
-                src.CopyTo(dstStream);
-        }
-
-        string json = ReadJson(copy);
+        // 복사하지 않고 읽기 전용으로 직접 연다.
+        // (관리자 권한으로 사용자 쓰기 가능한 임시 폴더에 파일을 만들면 정션 공격에 악용될 수 있다)
+        string json = ReadJson(source);
         var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
         var root = (Dictionary<string, object>)serializer.DeserializeObject(json);
 
@@ -215,6 +221,8 @@ class GHubAgent
     public bool PlayMacro(string macroId, bool start)
     {
         if (!connected) return false;
+        // 매크로 ID는 G Hub 설정에서 온 값이므로, JSON을 깨뜨릴 수 있는 형식이면 보내지 않는다
+        if (string.IsNullOrEmpty(macroId) || !Regex.IsMatch(macroId, "^[A-Za-z0-9-]+$")) return false;
         string id = Interlocked.Increment(ref messageId).ToString();
         queue.Add("{\"msgId\":\"" + id + "\",\"verb\":\"SET\",\"path\":\"/macro/playback\",\"payload\":{\"macroId\":\""
                   + macroId + "\",\"operation\":\"" + (start ? "START" : "STOP") + "\",\"triggerId\":\"ghubkeyboard\"}}");
@@ -267,6 +275,7 @@ class GHubAgent
                 var result = ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None).Result;
                 if (result.MessageType == WebSocketMessageType.Close) break;
                 text.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+                if (text.Length > 4 * 1024 * 1024) break;   // 비정상적으로 큰 메시지는 연결을 끊는다 (메모리 고갈 방지)
                 if (!result.EndOfMessage) continue;
 
                 string message = text.ToString();
@@ -281,6 +290,7 @@ class GHubAgent
             }
         }
         catch { }
+        try { ws.Abort(); } catch { }   // 읽기가 끝나면 연결을 닫아 다시 연결하게 한다
     }
 
     void SetConnected(bool value)
@@ -336,7 +346,8 @@ class MainForm : Form
     // Raw Input: 어느 장치에서 온 키 입력인지 알 수 있다.
     // G Hub 매크로는 "G Hub 가상 키보드"에서 나오므로, 이걸로 실제 키보드 입력과 구분한다.
     const int WM_INPUT = 0x00FF;
-    const uint RIDEV_INPUTSINK = 0x100, RID_INPUT = 0x10000003, RIDI_DEVICENAME = 0x20000007;
+    const int WM_INPUT_DEVICE_CHANGE = 0x00FE;
+    const uint RIDEV_INPUTSINK = 0x100, RIDEV_DEVNOTIFY = 0x2000, RID_INPUT = 0x10000003, RIDI_DEVICENAME = 0x20000007;
     const ushort RI_KEY_BREAK = 0x1, RI_KEY_E0 = 0x2;
     const string GHubVirtualKeyboard = "VID_046D&PID_C232";
 
@@ -374,7 +385,8 @@ class MainForm : Form
     bool checkUpdates = true;
     string selectedAppId, selectedMacroId;
 
-    readonly string settingsPath = Path.Combine(
+    const string SettingsKey = @"Software\GHubKeyboard";
+    readonly string legacySettingsPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "GHubKeyboard", "settings.txt");
 
     List<GHubSettings.App> apps = new List<GHubSettings.App>();
@@ -520,7 +532,10 @@ class MainForm : Form
                 if (latest <= Version.Parse(AppVersion)) return;
 
                 var page = Regex.Match(json, "\"html_url\"\\s*:\\s*\"([^\"]*/releases/tag/[^\"]*)\"");
-                string url = page.Success ? page.Groups[1].Value : RepoUrl + "/releases/latest";
+                // 이 저장소의 릴리스 페이지 주소일 때만 쓴다 (조작된 응답으로 엉뚱한 주소가 열리지 않게)
+                string url = RepoUrl + "/releases/latest";
+                if (page.Success && Regex.IsMatch(page.Groups[1].Value, "^" + Regex.Escape(RepoUrl + "/releases/tag/") + "[A-Za-z0-9._-]+$"))
+                    url = page.Groups[1].Value;
                 Ui(() =>
                 {
                     updateLink.Text = "새 버전 v" + tag.Groups[1].Value + " 있음 →";
@@ -532,11 +547,13 @@ class MainForm : Form
         }) { IsBackground = true }.Start();
     }
 
-    // 관리자 권한으로 실행 중이므로, 브라우저가 관리자 권한으로 뜨지 않게 탐색기를 거쳐 연다
+    // 관리자 권한으로 실행 중이므로, 브라우저가 관리자 권한으로 뜨지 않게 탐색기를 거쳐 연다.
+    // 탐색기는 전체 경로로 실행하고(exe 폴더의 가짜 explorer.exe 방지), https 주소만 연다.
     static void OpenUrl(string url)
     {
-        if (string.IsNullOrEmpty(url)) return;
-        try { Process.Start("explorer.exe", "\"" + url + "\""); } catch { }
+        if (string.IsNullOrEmpty(url) || !url.StartsWith("https://") || url.IndexOf('"') >= 0) return;
+        string explorer = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
+        try { Process.Start(explorer, "\"" + url + "\""); } catch { }
     }
 
     void ReloadMacros(bool showError)
@@ -765,7 +782,7 @@ class MainForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        var device = new RAWINPUTDEVICE { UsagePage = 1, Usage = 6, Flags = RIDEV_INPUTSINK, Target = Handle };
+        var device = new RAWINPUTDEVICE { UsagePage = 1, Usage = 6, Flags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, Target = Handle };
         if (!RegisterRawInputDevices(new[] { device }, 1, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE))))
             MessageBox.Show("Raw Input 등록에 실패했습니다. (오류 " + Marshal.GetLastWin32Error() + ")", "G Hub Keyboard");
     }
@@ -776,6 +793,8 @@ class MainForm : Form
     {
         if (m.Msg == WM_INPUT && (capturing || !suppress))
             HandleRawInput(m.LParam);
+        else if (m.Msg == WM_INPUT_DEVICE_CHANGE)
+            isGHubDevice.Clear();   // 장치를 뽑았다 꽂으면 핸들이 재사용될 수 있으므로 다시 확인한다
         base.WndProc(ref m);
     }
 
@@ -880,28 +899,44 @@ class MainForm : Form
 
     // ───────────────────────── 설정 저장 ─────────────────────────
 
+    // 설정은 레지스트리(HKCU\Software\GHubKeyboard)에 저장한다.
+    // 관리자 권한으로 사용자 폴더에 파일을 쓰면 링크/정션을 이용한 임의 파일 쓰기에 악용될 수 있기 때문이다.
     void LoadSettings()
     {
         try
         {
-            if (!File.Exists(settingsPath)) return;
-            foreach (var line in File.ReadAllLines(settingsPath, Encoding.UTF8))
+            using (var reg = Registry.CurrentUser.OpenSubKey(SettingsKey))
+            {
+                if (reg != null)
+                {
+                    foreach (var name in reg.GetValueNames())
+                        ApplySetting(name, reg.GetValue(name) as string);
+                    return;
+                }
+            }
+            // 예전 버전의 설정 파일이 있으면 한 번 읽어 온다 (읽기만 한다)
+            if (!File.Exists(legacySettingsPath)) return;
+            foreach (var line in File.ReadAllLines(legacySettingsPath, Encoding.UTF8))
             {
                 var parts = line.Split(new[] { '=' }, 2);
-                if (parts.Length != 2) continue;
-                string key = parts[0], value = parts[1];
-                if (key == "key")
-                {
-                    Keys k;
-                    if (Enum.TryParse(value, out k)) trigger = k;
-                }
-                else if (key == "suppress") suppress = value == "1";
-                else if (key == "updateCheck") checkUpdates = value == "1";
-                else if (key == "app") selectedAppId = value;
-                else if (key == "macroId") selectedMacroId = value;
+                if (parts.Length == 2) ApplySetting(parts[0], parts[1]);
             }
         }
         catch { }
+    }
+
+    void ApplySetting(string key, string value)
+    {
+        if (value == null) return;
+        if (key == "key")
+        {
+            Keys k;
+            if (Enum.TryParse(value, out k)) trigger = k;
+        }
+        else if (key == "suppress") suppress = value == "1";
+        else if (key == "updateCheck") checkUpdates = value == "1";
+        else if (key == "app") selectedAppId = value;
+        else if (key == "macroId") selectedMacroId = value;
     }
 
     void SaveSettings()
@@ -909,15 +944,14 @@ class MainForm : Form
         if (loadingUi) return;
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(settingsPath));
-            File.WriteAllLines(settingsPath, new[]
+            using (var reg = Registry.CurrentUser.CreateSubKey(SettingsKey))
             {
-                "key=" + trigger,
-                "suppress=" + (suppress ? "1" : "0"),
-                "updateCheck=" + (checkUpdates ? "1" : "0"),
-                "app=" + selectedAppId,
-                "macroId=" + selectedMacroId
-            }, Encoding.UTF8);
+                reg.SetValue("key", trigger.ToString());
+                reg.SetValue("suppress", suppress ? "1" : "0");
+                reg.SetValue("updateCheck", checkUpdates ? "1" : "0");
+                reg.SetValue("app", selectedAppId ?? "");
+                reg.SetValue("macroId", selectedMacroId ?? "");
+            }
         }
         catch { }
     }
