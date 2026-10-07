@@ -11,6 +11,7 @@
 ## 특징
 
 - G HUB에 만들어 둔 매크로 목록을 **자동으로 불러와서** 고르기만 하면 됩니다
+- 새 버전이 나오면 창 하단에 알려 줍니다
 - 트리거 키를 누르면 매크로 시작, 떼면 멈춤. **마우스 버튼에 할당한 것과 똑같이** 동작합니다
   - 누르고 있는 동안 반복 / 토글 / 한 번 실행 등 G HUB의 매크로 설정이 그대로 적용됩니다
 - Lua 스크립트나 G HUB 설정 변경이 필요 없습니다
@@ -46,7 +47,11 @@ G HUB에서 매크로를 새로 만들었다면 **새로고침**을 누르세요
 - **G HUB 업데이트 후 동작하지 않을 수 있습니다.** 공개 API가 아닌 G HUB 내부 통신을 사용하기 때문입니다
 - **관리자 권한이 필요한 이유**: 게임이 관리자 권한으로 실행 중이면, 일반 권한 프로그램은 그 게임 위에서 누른 키를 감지할 수 없습니다
 - **키보드 감지에 대해**: 트리거 키를 감지하기 위해 전체 키보드 입력을 확인합니다.
-  키 입력을 **저장하거나 외부로 전송하지 않으며**, 통신은 내 PC의 G HUB(`localhost`)와만 합니다. 소스 코드에서 직접 확인할 수 있습니다
+  키 입력을 **저장하거나 외부로 전송하지 않습니다.** 소스 코드에서 직접 확인할 수 있습니다
+- **통신하는 곳**
+  - 내 PC의 G HUB(`localhost:9010`): 매크로 실행
+  - GitHub API(`api.github.com`): 시작할 때 최신 릴리스 **버전 번호만** 확인합니다. 새 버전이 있으면 창 하단에 알림 링크가 뜨고, 다운로드는 직접 합니다.
+    **시작할 때 새 버전 확인**을 끄면 GitHub에 접속하지 않습니다
 - **백신 / SmartScreen 경고**: 서명되지 않은 exe가 키보드 감지와 관리자 권한을 쓰기 때문에 경고가 뜰 수 있습니다.
   불안하면 아래 방법으로 직접 빌드해서 사용하세요
 - 설정은 `%APPDATA%\GHubKeyboard\settings.txt`에 저장됩니다
@@ -71,6 +76,10 @@ build.bat release    :: 배포용 dist\GHubKeyboard-v1.0.0.zip 까지 생성
 - Logitech G HUB (실행 중이어야 함)
 - .NET Framework 4.5 이상 (Windows 10/11에 기본 포함)
 
+## 만든 사람
+
+지금 할인 중인 스팀 게임을 한국어·원화로 모아 보는 사이트도 운영하고 있습니다 → **[gamer4.info](https://gamer4.info)**
+
 ## 라이선스
 
 [MIT](LICENSE)
@@ -89,6 +98,7 @@ A small Windows tool that triggers **Logitech G HUB macros with any keyboard key
 - Press the trigger key to start the macro and release it to stop, exactly like a mouse button assignment
   (repeat while held / toggle / play once settings are respected)
 - No Lua scripts and no changes to your G HUB setup
+- Shows a notice at the bottom when a new version is released
 - Single ~30 KB executable, no installation
 
 ### Usage
@@ -111,8 +121,10 @@ A small Windows tool that triggers **Logitech G HUB macros with any keyboard key
 
 - **May break after a G HUB update**, since it relies on G HUB's internal, undocumented interface
 - Administrator rights are needed to detect key presses while an elevated game is in the foreground
-- The keyboard hook is only used to detect the trigger key. Keystrokes are **never stored or sent anywhere**;
-  the only connection is to G HUB on `localhost`
+- The keyboard hook is only used to detect the trigger key. Keystrokes are **never stored or sent anywhere**
+- Network connections: G HUB on `localhost:9010` (macro playback), and `api.github.com` once at startup to check
+  the latest release **version number only** (shown as a link at the bottom; nothing is downloaded).
+  Uncheck **시작할 때 새 버전 확인** (check for updates on startup) to disable it
 - Antivirus / SmartScreen may warn because it is an unsigned executable using a keyboard hook. You can build it yourself (see below)
 - Using macros in games may violate the game's terms of service. **Use at your own risk.**
 
@@ -124,6 +136,10 @@ Uses the C# compiler included with Windows (.NET Framework 4.x). No Visual Studi
 build.bat            :: builds bin\GHubKeyboard.exe
 build.bat release    :: also creates dist\GHubKeyboard-v1.0.0.zip
 ```
+
+### Author
+
+I also run **[gamer4.info](https://gamer4.info)**, a Korean site listing Steam games currently on sale (prices in KRW).
 
 ### License
 
