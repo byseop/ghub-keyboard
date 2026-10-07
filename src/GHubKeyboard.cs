@@ -6,14 +6,17 @@
 //  2. 트리거 키를 누르면 G Hub 에이전트(ws://localhost:9010)에 매크로 START를, 떼면 STOP을 보낸다.
 //     G Hub 화면이 매크로를 다룰 때 쓰는 것과 같은 통로라서, 마우스 버튼을 누른 것과 똑같이 동작한다.
 //     (누르고 있는 동안 반복 / 토글 / 한 번 실행 등 매크로 설정이 그대로 적용된다)
+//  3. 시작할 때 GitHub에서 최신 릴리스 버전 번호를 확인해서, 새 버전이 있으면 하단에 알려 준다.
 
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.WebSockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -352,6 +355,11 @@ class MainForm : Form
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern uint GetRawInputDeviceInfo(IntPtr device, uint command, StringBuilder data, ref uint size);
 
+    const string AppVersion = "1.0.0";
+    const string Repo = "byseop/ghub-keyboard";
+    const string RepoUrl = "https://github.com/" + Repo;
+    const string SiteUrl = "https://gamer4.info";
+
     readonly HookProc proc;   // GC에 수거되지 않도록 필드로 보관
     IntPtr hook;
     uint hookThreadId;
@@ -363,6 +371,7 @@ class MainForm : Form
     // 설정 (키 감지 스레드에서도 읽는다)
     volatile Keys trigger = Keys.F8;
     volatile bool suppress = true;
+    bool checkUpdates = true;
     string selectedAppId, selectedMacroId;
 
     readonly string settingsPath = Path.Combine(
@@ -381,7 +390,8 @@ class MainForm : Form
 
     ComboBox appBox, macroBox;
     Label modeLabel, keyLabel, connectionLabel, stateLabel;
-    CheckBox suppressBox;
+    CheckBox suppressBox, updateBox;
+    LinkLabel updateLink;
 
     public MainForm()
     {
@@ -411,12 +421,12 @@ class MainForm : Form
     void BuildUi()
     {
         loadingUi = true;
-        Text = "G Hub Keyboard v1.0.0";
+        Text = "G Hub Keyboard v" + AppVersion;
         Font = new Font("Malgun Gothic", 9.5f);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(400, 300);
+        ClientSize = new Size(400, 368);
 
         Controls.Add(new Label { Text = "게임 프로필", Location = new Point(20, 22), AutoSize = true });
         appBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(110, 18), Size = new Size(185, 28) };
@@ -451,16 +461,82 @@ class MainForm : Form
         };
         Controls.Add(suppressBox);
 
-        connectionLabel = new Label { Location = new Point(20, 198), Size = new Size(360, 22) };
+        updateBox = new CheckBox { Text = "시작할 때 새 버전 확인", Location = new Point(20, 188), AutoSize = true, Checked = checkUpdates };
+        updateBox.CheckedChanged += (s, e) => { checkUpdates = updateBox.Checked; SaveSettings(); };
+        Controls.Add(updateBox);
+
+        connectionLabel = new Label { Location = new Point(20, 222), Size = new Size(360, 22) };
         Controls.Add(connectionLabel);
 
-        stateLabel = new Label { Location = new Point(20, 230), Size = new Size(360, 48), TextAlign = ContentAlignment.MiddleCenter, BorderStyle = BorderStyle.FixedSingle };
+        stateLabel = new Label { Location = new Point(20, 254), Size = new Size(360, 48), TextAlign = ContentAlignment.MiddleCenter, BorderStyle = BorderStyle.FixedSingle };
         Controls.Add(stateLabel);
+
+        // 제작자 사이트
+        var siteLink = new LinkLabel { Text = "지금 할인 중인 스팀 게임 보기 → gamer4.info", Location = new Point(20, 312), AutoSize = true };
+        siteLink.LinkClicked += (s, e) => OpenUrl(SiteUrl);
+        Controls.Add(siteLink);
+
+        // 하단: 버전 / GitHub 링크, 새 버전 알림
+        var versionLink = new LinkLabel { Text = "v" + AppVersion + " · GitHub", Location = new Point(20, 338), AutoSize = true, LinkColor = SystemColors.GrayText };
+        versionLink.LinkClicked += (s, e) => OpenUrl(RepoUrl);
+        Controls.Add(versionLink);
+
+        updateLink = new LinkLabel { Location = new Point(180, 338), Size = new Size(200, 22), TextAlign = ContentAlignment.TopRight, Visible = false };
+        updateLink.LinkClicked += (s, e) => OpenUrl(updateLink.Tag as string);
+        Controls.Add(updateLink);
 
         UpdateKeyLabel();
         UpdateConnection();
         UpdateState();
         loadingUi = false;
+    }
+
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        if (checkUpdates) CheckForUpdate();
+    }
+
+    // GitHub에서 최신 릴리스 버전 번호만 확인한다. 다운로드나 설치는 하지 않는다.
+    void CheckForUpdate()
+    {
+        new Thread(() =>
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;   // TLS 1.2
+                var request = (HttpWebRequest)WebRequest.Create("https://api.github.com/repos/" + Repo + "/releases/latest");
+                request.UserAgent = "GHubKeyboard/" + AppVersion;
+                request.Accept = "application/vnd.github+json";
+                request.Timeout = 5000;
+                string json;
+                using (var response = request.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream()))
+                    json = reader.ReadToEnd();
+
+                var tag = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"v?([0-9.]+)\"");
+                Version latest;
+                if (!tag.Success || !Version.TryParse(tag.Groups[1].Value, out latest)) return;
+                if (latest <= Version.Parse(AppVersion)) return;
+
+                var page = Regex.Match(json, "\"html_url\"\\s*:\\s*\"([^\"]*/releases/tag/[^\"]*)\"");
+                string url = page.Success ? page.Groups[1].Value : RepoUrl + "/releases/latest";
+                Ui(() =>
+                {
+                    updateLink.Text = "새 버전 v" + tag.Groups[1].Value + " 있음 →";
+                    updateLink.Tag = url;
+                    updateLink.Visible = true;
+                });
+            }
+            catch { }   // 오프라인이거나 저장소가 비공개면 조용히 넘어간다
+        }) { IsBackground = true }.Start();
+    }
+
+    // 관리자 권한으로 실행 중이므로, 브라우저가 관리자 권한으로 뜨지 않게 탐색기를 거쳐 연다
+    static void OpenUrl(string url)
+    {
+        if (string.IsNullOrEmpty(url)) return;
+        try { Process.Start("explorer.exe", "\"" + url + "\""); } catch { }
     }
 
     void ReloadMacros(bool showError)
@@ -820,6 +896,7 @@ class MainForm : Form
                     if (Enum.TryParse(value, out k)) trigger = k;
                 }
                 else if (key == "suppress") suppress = value == "1";
+                else if (key == "updateCheck") checkUpdates = value == "1";
                 else if (key == "app") selectedAppId = value;
                 else if (key == "macroId") selectedMacroId = value;
             }
@@ -837,6 +914,7 @@ class MainForm : Form
             {
                 "key=" + trigger,
                 "suppress=" + (suppress ? "1" : "0"),
+                "updateCheck=" + (checkUpdates ? "1" : "0"),
                 "app=" + selectedAppId,
                 "macroId=" + selectedMacroId
             }, Encoding.UTF8);
