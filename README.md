@@ -13,22 +13,26 @@
 ## 특징
 
 - G HUB에 만들어 둔 매크로 목록을 **자동으로 불러와서** 고르기만 하면 됩니다
-- 새 버전이 나오면 창 하단에 알려 줍니다
+- **키와 매크로를 여러 개 짝지어 등록**할 수 있고, 키마다 독립적으로 동작해서 **여러 매크로를 동시에** 쓸 수 있습니다
 - 트리거 키를 누르면 매크로 시작, 떼면 멈춤. **마우스 버튼에 할당한 것과 똑같이** 동작합니다
   - 누르고 있는 동안 반복 / 토글 / 한 번 실행 등 G HUB의 매크로 설정이 그대로 적용됩니다
 - Lua 스크립트나 G HUB 설정 변경이 필요 없습니다
-- 설치 없이 exe 파일 하나(약 30KB)로 실행됩니다
+- 새 버전이 나오면 창 하단에 알려 줍니다
+- 설치 없이 exe 파일 하나(약 40KB)로 실행됩니다
 
 ## 사용법
 
 1. [Releases](../../releases)에서 zip을 받아 압축을 풀고, `GHubKeyboard.exe`를 **`C:\Program Files\GHubKeyboard\` 같은 관리자 전용 폴더**에 넣습니다 (아래 "보안 권장 사항" 참고)
 2. G HUB가 켜져 있는 상태에서 `GHubKeyboard.exe`를 실행합니다 (관리자 권한 확인 창이 뜹니다)
 3. 창에 **● G Hub 연결됨**이 표시되는지 확인합니다
-4. **게임 프로필**과 **매크로**를 고릅니다
-5. **키 변경**을 누르고, 트리거로 쓸 키를 누릅니다
-6. 트리거 키를 누르면 매크로가 실행됩니다
+4. **추가**를 누르고 게임 프로필과 매크로를 고른 뒤, **키 지정**을 눌러 트리거로 쓸 키를 누릅니다
+5. 필요한 만큼 반복해서 키와 매크로를 등록합니다 (한 키에는 매크로 하나만 연결할 수 있습니다)
+6. 등록한 키를 누르면 매크로가 실행됩니다. 여러 키를 동시에 눌러도 각각 실행됩니다
 
+각 줄 앞의 체크박스로 지우지 않고 잠시 **끄고 켤** 수 있습니다. 꺼 둔 키는 매크로를 실행하지 않고 원래 키로 동작합니다.
+목록의 줄을 두 번 클릭하면 수정, Delete 키나 **삭제**로 지울 수 있습니다.
 G HUB에서 매크로를 새로 만들었다면 **새로고침**을 누르세요.
+v1.0.0에서 쓰던 설정은 목록의 첫 줄로 자동으로 옮겨집니다.
 
 ### 옵션
 
@@ -109,11 +113,12 @@ The UI is in Korean. See the screenshot above.
 ### Features
 
 - Automatically lists the macros you created in G HUB, per game profile
+- Map **multiple keys to multiple macros**; each key works independently, so several macros can run at once
 - Press the trigger key to start the macro and release it to stop, exactly like a mouse button assignment
   (repeat while held / toggle / play once settings are respected)
 - No Lua scripts and no changes to your G HUB setup
 - Shows a notice at the bottom when a new version is released
-- Single ~30 KB executable, no installation
+- Single ~40 KB executable, no installation
 
 ### Usage
 
@@ -121,9 +126,9 @@ The UI is in Korean. See the screenshot above.
    such as `C:\Program Files\GHubKeyboard\` (it runs elevated; running it from Downloads/Desktop allows DLL/config planting by other software)
 2. With G HUB running, start `GHubKeyboard.exe` (it asks for administrator rights)
 3. Check that it shows **● G Hub 연결됨** (connected)
-4. Pick a game profile and a macro
-5. Click **키 변경** (change key) and press the key you want to use
-6. Press the trigger key to run the macro
+4. Click **추가** (add), pick a game profile and a macro, click **키 지정** (set key) and press the key you want to use
+5. Repeat for as many key/macro pairs as you need (one macro per key). Use the checkbox on each row to turn a mapping off without deleting it
+6. Press a mapped key to run its macro; pressing several keys runs several macros
 
 ### How it works
 

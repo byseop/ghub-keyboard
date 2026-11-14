@@ -4,7 +4,7 @@ rem Run with "release" to also create dist\GHubKeyboard-v<version>.zip for GitHu
 setlocal
 cd /d "%~dp0"
 
-set VERSION=1.0.0
+set VERSION=1.1.0
 set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 if not exist "%CSC%" set CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe
 if not exist "%CSC%" (
