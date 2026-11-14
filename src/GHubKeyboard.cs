@@ -6,6 +6,7 @@
 //  2. 트리거 키를 누르면 G Hub 에이전트(ws://localhost:9010)에 매크로 START를, 떼면 STOP을 보낸다.
 //     G Hub 화면이 매크로를 다룰 때 쓰는 것과 같은 통로라서, 마우스 버튼을 누른 것과 똑같이 동작한다.
 //     (누르고 있는 동안 반복 / 토글 / 한 번 실행 등 매크로 설정이 그대로 적용된다)
+//     키와 매크로의 짝을 여러 개 등록할 수 있고, 키마다 다른 트리거 ID를 써서 각각 독립적으로 동작한다.
 //  3. 시작할 때 GitHub에서 최신 릴리스 버전 번호를 확인해서, 새 버전이 있으면 하단에 알려 준다.
 
 using System;
@@ -30,8 +31,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("G Hub Keyboard")]
 [assembly: AssemblyDescription("Trigger Logitech G HUB macros with a keyboard key (unofficial)")]
 [assembly: AssemblyProduct("G Hub Keyboard")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 static class Program
 {
@@ -217,15 +218,17 @@ class GHubAgent
         stopping = true;
     }
 
-    // 연결되지 않았을 때는 버린다 (나중에 늦게 전송되면 엉뚱한 때 매크로가 실행되므로)
-    public bool PlayMacro(string macroId, bool start)
+    // 연결되지 않았을 때는 버린다 (나중에 늦게 전송되면 엉뚱한 때 매크로가 실행되므로).
+    // triggerId는 G Hub가 "어느 버튼이 눌렸는지"를 구분하는 값이라, 키마다 다르게 주면 매크로를 동시에 따로 돌릴 수 있다.
+    public bool PlayMacro(string macroId, string triggerId, bool start)
     {
         if (!connected) return false;
         // 매크로 ID는 G Hub 설정에서 온 값이므로, JSON을 깨뜨릴 수 있는 형식이면 보내지 않는다
         if (string.IsNullOrEmpty(macroId) || !Regex.IsMatch(macroId, "^[A-Za-z0-9-]+$")) return false;
+        if (string.IsNullOrEmpty(triggerId) || !Regex.IsMatch(triggerId, "^[A-Za-z0-9_-]+$")) return false;
         string id = Interlocked.Increment(ref messageId).ToString();
         queue.Add("{\"msgId\":\"" + id + "\",\"verb\":\"SET\",\"path\":\"/macro/playback\",\"payload\":{\"macroId\":\""
-                  + macroId + "\",\"operation\":\"" + (start ? "START" : "STOP") + "\",\"triggerId\":\"ghubkeyboard\"}}");
+                  + macroId + "\",\"operation\":\"" + (start ? "START" : "STOP") + "\",\"triggerId\":\"" + triggerId + "\"}}");
         return true;
     }
 
@@ -301,6 +304,21 @@ class GHubAgent
     }
 }
 
+// 트리거 키 하나와 G Hub 매크로 하나의 짝
+class Mapping
+{
+    public Keys Key;
+    public string AppId, MacroId;
+    public volatile bool Enabled = true;   // 끄면 키를 눌러도 실행하지 않고, 키 입력도 막지 않는다
+
+    // 실행 상태 (MainForm.sync로 보호)
+    public bool Held, Playing, ToggledOn;
+    public IntPtr HeldDevice;
+
+    // 키마다 다른 트리거 ID를 써서 G Hub가 각 키를 별개의 버튼처럼 다루게 한다
+    public string TriggerId { get { return "ghubkeyboard-" + Key; } }
+}
+
 class MainForm : Form
 {
     const int WH_KEYBOARD_LL = 13;
@@ -366,7 +384,7 @@ class MainForm : Form
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern uint GetRawInputDeviceInfo(IntPtr device, uint command, StringBuilder data, ref uint size);
 
-    const string AppVersion = "1.0.0";
+    const string AppVersion = "1.1.0";
     const string Repo = "byseop/ghub-keyboard";
     const string RepoUrl = "https://github.com/" + Repo;
     const string SiteUrl = "https://gamer4.info";
@@ -374,36 +392,39 @@ class MainForm : Form
     readonly HookProc proc;   // GC에 수거되지 않도록 필드로 보관
     IntPtr hook;
     uint hookThreadId;
-    IntPtr heldDevice;
     readonly Dictionary<IntPtr, bool> isGHubDevice = new Dictionary<IntPtr, bool>();
 
     readonly GHubAgent agent = new GHubAgent();
 
-    // 설정 (키 감지 스레드에서도 읽는다)
-    volatile Keys trigger = Keys.F8;
+    // 설정. 키 감지 스레드에서도 읽으므로, 목록은 바꿀 때마다 새 배열로 통째로 교체한다.
+    volatile Mapping[] mappings = new Mapping[0];
     volatile bool suppress = true;
     bool checkUpdates = true;
-    string selectedAppId, selectedMacroId;
+
+    // G Hub 매크로 정보 (ID → 매크로 / 게임 프로필). 다시 읽을 때 통째로 교체한다.
+    volatile Dictionary<string, GHubSettings.Macro> macrosById = new Dictionary<string, GHubSettings.Macro>();
+    Dictionary<string, GHubSettings.App> appByMacroId = new Dictionary<string, GHubSettings.App>();
+    List<GHubSettings.App> apps = new List<GHubSettings.App>();
 
     const string SettingsKey = @"Software\GHubKeyboard";
     readonly string legacySettingsPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "GHubKeyboard", "settings.txt");
 
-    List<GHubSettings.App> apps = new List<GHubSettings.App>();
-    volatile bool capturing;
-    bool loadingUi;
+    volatile bool capturing;   // 키 변경 중
+    volatile bool paused;      // 목록 편집 중에는 매크로를 실행하지 않는다
+    Action<Keys> captureCallback;
 
-    // 아래 상태는 키 감지 스레드와 화면 스레드가 함께 쓰므로 sync로 보호한다
+    // 매핑의 실행 상태는 키 감지 스레드와 화면 스레드가 함께 쓰므로 sync로 보호한다
     readonly object sync = new object();
-    bool held;
-    GHubSettings.Macro currentMacro;   // 트리거 키로 실행할 매크로
-    GHubSettings.Macro playing;        // 지금 실행 중인 매크로 (STOP을 보낼 대상)
-    GHubSettings.Macro toggledOn;      // 켜져 있는 토글형 매크로 (끌 때 한 번 더 눌러 주기 위해)
 
-    ComboBox appBox, macroBox;
-    Label modeLabel, keyLabel, connectionLabel, stateLabel;
+    ListView list;
+    bool refreshingList, ignoreNextCheck, shown;
+    Button editButton, deleteButton;
+    Label connectionLabel, statusLabel;
     CheckBox suppressBox, updateBox;
     LinkLabel updateLink;
+
+    public bool Capturing { get { return capturing; } }
 
     public MainForm()
     {
@@ -416,96 +437,101 @@ class MainForm : Form
         agent.ConnectionChanged += connected =>
         {
             if (!connected) ResetPlayback();
-            Ui(UpdateConnection);
+            Ui(() => { UpdateConnection(); RefreshStates(); });
         };
-        agent.Error += message => Ui(() =>
-        {
-            stateLabel.Text = "G Hub 오류: " + message;
-            stateLabel.BackColor = Color.FromArgb(255, 222, 200);
-        });
+        agent.Error += message => Ui(() => ShowStatus("G Hub 오류: " + message, true));
         agent.Start();
     }
-
-    GHubSettings.Macro SelectedMacro { get { return macroBox.SelectedItem as GHubSettings.Macro; } }
 
     // ───────────────────────── 화면 ─────────────────────────
 
     void BuildUi()
     {
-        loadingUi = true;
         Text = "G Hub Keyboard v" + AppVersion;
         Font = new Font("Malgun Gothic", 9.5f);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(400, 368);
+        ClientSize = new Size(540, 432);
 
-        Controls.Add(new Label { Text = "게임 프로필", Location = new Point(20, 22), AutoSize = true });
-        appBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(110, 18), Size = new Size(185, 28) };
-        appBox.SelectedIndexChanged += (s, e) => { if (!loadingUi) OnAppChanged(); };
-        Controls.Add(appBox);
+        list = new ListView
+        {
+            View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false, MultiSelect = false,
+            CheckBoxes = true, Location = new Point(20, 20), Size = new Size(500, 190)
+        };
+        list.Columns.Add("사용 / 트리거 키", 118);
+        list.Columns.Add("게임 프로필", 85);
+        list.Columns.Add("매크로", 100);
+        list.Columns.Add("종류", 132);
+        list.Columns.Add("상태", 58);
+        list.ItemChecked += (s, e) => OnItemChecked(e.Item);
+        // 체크박스 목록은 두 번 클릭하면 체크가 바뀌는데, 두 번 클릭은 수정용으로 쓰므로 그때는 체크를 바꾸지 않는다
+        list.MouseDown += (s, e) => ignoreNextCheck = e.Clicks > 1;
+        list.ItemCheck += (s, e) => { if (ignoreNextCheck) { e.NewValue = e.CurrentValue; ignoreNextCheck = false; } };
+        list.DoubleClick += (s, e) => EditMapping();
+        list.SelectedIndexChanged += (s, e) => UpdateButtons();
+        list.KeyDown += (s, e) => { if (e.KeyCode == Keys.Delete) DeleteMapping(); };
+        Controls.Add(list);
 
-        var reloadButton = new Button { Text = "새로고침", Location = new Point(302, 17), Size = new Size(78, 29) };
+        var addButton = new Button { Text = "추가", Location = new Point(20, 220), Size = new Size(80, 30) };
+        addButton.Click += (s, e) => AddMapping();
+        Controls.Add(addButton);
+
+        editButton = new Button { Text = "수정", Location = new Point(106, 220), Size = new Size(80, 30) };
+        editButton.Click += (s, e) => EditMapping();
+        Controls.Add(editButton);
+
+        deleteButton = new Button { Text = "삭제", Location = new Point(192, 220), Size = new Size(80, 30) };
+        deleteButton.Click += (s, e) => DeleteMapping();
+        Controls.Add(deleteButton);
+
+        var reloadButton = new Button { Text = "새로고침", Location = new Point(440, 220), Size = new Size(80, 30) };
         reloadButton.Click += (s, e) => ReloadMacros(true);
         Controls.Add(reloadButton);
 
-        Controls.Add(new Label { Text = "매크로", Location = new Point(20, 58), AutoSize = true });
-        macroBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(110, 54), Size = new Size(270, 28) };
-        macroBox.SelectedIndexChanged += (s, e) => { if (!loadingUi) OnMacroChanged(); };
-        Controls.Add(macroBox);
-
-        modeLabel = new Label { Location = new Point(110, 86), AutoSize = true, ForeColor = SystemColors.GrayText };
-        Controls.Add(modeLabel);
-
-        keyLabel = new Label { Location = new Point(20, 122), AutoSize = true, Font = new Font("Malgun Gothic", 12f, FontStyle.Bold) };
-        Controls.Add(keyLabel);
-        var changeButton = new Button { Text = "키 변경", Location = new Point(270, 117), Size = new Size(110, 32) };
-        changeButton.Click += (s, e) => StartCapture();
-        Controls.Add(changeButton);
-
-        suppressBox = new CheckBox { Text = "트리거 키의 원래 입력 막기", Location = new Point(20, 162), AutoSize = true, Checked = suppress };
+        // 매크로가 보조키를 누르는 경우가 많고, 입력을 막으면 G Hub 매크로 입력까지 막히므로 보조키는 막지 않는다
+        suppressBox = new CheckBox { Text = "트리거 키의 원래 입력 막기 (Ctrl/Shift/Alt는 항상 전달)", Location = new Point(20, 262), AutoSize = true, Checked = suppress };
         suppressBox.CheckedChanged += (s, e) =>
         {
             if (suppress == suppressBox.Checked) return;
-            ReleaseTrigger();
+            StopAll();
             suppress = suppressBox.Checked;
             SaveSettings();
         };
         Controls.Add(suppressBox);
 
-        updateBox = new CheckBox { Text = "시작할 때 새 버전 확인", Location = new Point(20, 188), AutoSize = true, Checked = checkUpdates };
+        updateBox = new CheckBox { Text = "시작할 때 새 버전 확인", Location = new Point(20, 288), AutoSize = true, Checked = checkUpdates };
         updateBox.CheckedChanged += (s, e) => { checkUpdates = updateBox.Checked; SaveSettings(); };
         Controls.Add(updateBox);
 
-        connectionLabel = new Label { Location = new Point(20, 222), Size = new Size(360, 22) };
+        connectionLabel = new Label { Location = new Point(20, 320), Size = new Size(500, 22) };
         Controls.Add(connectionLabel);
 
-        stateLabel = new Label { Location = new Point(20, 254), Size = new Size(360, 48), TextAlign = ContentAlignment.MiddleCenter, BorderStyle = BorderStyle.FixedSingle };
-        Controls.Add(stateLabel);
+        statusLabel = new Label { Location = new Point(20, 344), Size = new Size(500, 22), AutoEllipsis = true };
+        Controls.Add(statusLabel);
 
         // 제작자 사이트
-        var siteLink = new LinkLabel { Text = "지금 할인 중인 스팀 게임 보기 → gamer4.info", Location = new Point(20, 312), AutoSize = true };
+        var siteLink = new LinkLabel { Text = "지금 할인 중인 스팀 게임 보기 → gamer4.info", Location = new Point(20, 378), AutoSize = true };
         siteLink.LinkClicked += (s, e) => OpenUrl(SiteUrl);
         Controls.Add(siteLink);
 
         // 하단: 버전 / GitHub 링크, 새 버전 알림
-        var versionLink = new LinkLabel { Text = "v" + AppVersion + " · GitHub", Location = new Point(20, 338), AutoSize = true, LinkColor = SystemColors.GrayText };
+        var versionLink = new LinkLabel { Text = "v" + AppVersion + " · GitHub", Location = new Point(20, 404), AutoSize = true, LinkColor = SystemColors.GrayText };
         versionLink.LinkClicked += (s, e) => OpenUrl(RepoUrl);
         Controls.Add(versionLink);
 
-        updateLink = new LinkLabel { Location = new Point(180, 338), Size = new Size(200, 22), TextAlign = ContentAlignment.TopRight, Visible = false };
+        updateLink = new LinkLabel { Location = new Point(320, 404), Size = new Size(200, 22), TextAlign = ContentAlignment.TopRight, Visible = false };
         updateLink.LinkClicked += (s, e) => OpenUrl(updateLink.Tag as string);
         Controls.Add(updateLink);
 
-        UpdateKeyLabel();
         UpdateConnection();
-        UpdateState();
-        loadingUi = false;
     }
 
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        shown = true;
+        RefreshList();   // 창이 만들어지는 동안 바뀌었을 수 있는 체크 상태를 설정값으로 맞춘다
         if (checkUpdates) CheckForUpdate();
     }
 
@@ -558,6 +584,7 @@ class MainForm : Form
 
     void ReloadMacros(bool showError)
     {
+        StopAll();
         try
         {
             apps = GHubSettings.Load();
@@ -568,65 +595,17 @@ class MainForm : Form
             if (showError) MessageBox.Show("G Hub 매크로를 읽지 못했습니다.\n" + ex.Message, "G Hub Keyboard");
         }
 
-        loadingUi = true;
-        appBox.Items.Clear();
-        foreach (var app in apps) appBox.Items.Add(app);
-        var selected = apps.FirstOrDefault(a => a.Id == selectedAppId) ?? apps.FirstOrDefault();
-        if (selected != null) appBox.SelectedItem = selected;
-        loadingUi = false;
-        OnAppChanged();
-    }
-
-    void OnAppChanged()
-    {
-        var app = appBox.SelectedItem as GHubSettings.App;
-        loadingUi = true;
-        macroBox.Items.Clear();
-        if (app != null)
-        {
-            selectedAppId = app.Id;
-            foreach (var m in app.Macros) macroBox.Items.Add(m);
-            var macro = app.Macros.FirstOrDefault(m => m.Id == selectedMacroId) ?? app.Macros.FirstOrDefault();
-            if (macro != null) macroBox.SelectedItem = macro;
-        }
-        loadingUi = false;
-        OnMacroChanged();
-    }
-
-    void OnMacroChanged()
-    {
-        ReleaseTrigger();
-        TurnOffToggle();
-        var macro = SelectedMacro;
-        lock (sync) currentMacro = macro;
-        selectedMacroId = macro == null ? null : macro.Id;
-        modeLabel.Text = macro == null ? "" : "종류: " + ModeText(macro.Mode);
-        SaveSettings();
-        UpdateState();
-    }
-
-    static string ModeText(GHubSettings.Mode mode)
-    {
-        switch (mode)
-        {
-            case GHubSettings.Mode.Held: return "누르고 있는 동안 반복";
-            case GHubSettings.Mode.Toggle: return "토글 (한 번 누르면 켜지고, 다시 누르면 꺼짐)";
-            case GHubSettings.Mode.PressRelease: return "누를 때 / 뗄 때 실행";
-            default: return "한 번 실행";
-        }
-    }
-
-    void UpdateKeyLabel()
-    {
-        keyLabel.Text = "트리거 키: " + trigger;
-
-        // 매크로가 보조키를 누르는 경우가 많고, 입력을 막으면 G Hub 매크로 입력까지 막히므로 보조키는 막지 않는다
-        bool modifier = trigger == Keys.LControlKey || trigger == Keys.RControlKey
-                     || trigger == Keys.LShiftKey || trigger == Keys.RShiftKey
-                     || trigger == Keys.LMenu || trigger == Keys.RMenu;
-        if (modifier) suppressBox.Checked = false;
-        suppressBox.Enabled = !modifier;
-        suppressBox.Text = modifier ? "트리거 키의 원래 입력 막기 (Ctrl/Shift/Alt는 불가)" : "트리거 키의 원래 입력 막기";
+        var byId = new Dictionary<string, GHubSettings.Macro>();
+        var appOf = new Dictionary<string, GHubSettings.App>();
+        foreach (var app in apps)
+            foreach (var macro in app.Macros)
+            {
+                byId[macro.Id] = macro;
+                appOf[macro.Id] = app;
+            }
+        appByMacroId = appOf;
+        macrosById = byId;
+        RefreshList();
     }
 
     void UpdateConnection()
@@ -634,98 +613,284 @@ class MainForm : Form
         bool ok = agent.Connected;
         connectionLabel.Text = ok ? "● G Hub 연결됨" : "● G Hub에 연결하는 중... (G Hub가 켜져 있는지 확인하세요)";
         connectionLabel.ForeColor = ok ? Color.FromArgb(0, 120, 60) : Color.FromArgb(192, 80, 0);
-        UpdateState();
     }
 
-    void UpdateState()
+    void ShowStatus(string text, bool error)
     {
-        GHubSettings.Macro running, macro;
+        statusLabel.Text = text;
+        statusLabel.ForeColor = error ? Color.FromArgb(192, 60, 0) : SystemColors.ControlText;
+    }
+
+    // 목록 전체를 다시 그린다 (매핑이나 G Hub 매크로가 바뀌었을 때)
+    void RefreshList()
+    {
+        int selected = list.SelectedIndices.Count > 0 ? list.SelectedIndices[0] : -1;
+        refreshingList = true;
+        list.BeginUpdate();
+        list.Items.Clear();
+        foreach (var m in mappings)
+        {
+            GHubSettings.Macro macro;
+            GHubSettings.App app;
+            bool found = macrosById.TryGetValue(m.MacroId ?? "", out macro);
+            appByMacroId.TryGetValue(m.MacroId ?? "", out app);
+            var item = new ListViewItem(KeyName(m.Key));
+            item.SubItems.Add(app != null ? app.Name : "-");
+            item.SubItems.Add(found ? macro.Name : "(G Hub에 없음)");
+            item.SubItems.Add(found ? ModeText(macro.Mode) : "-");
+            item.SubItems.Add("");
+            item.Checked = m.Enabled;
+            list.Items.Add(item);
+        }
+        if (selected >= 0 && selected < list.Items.Count) list.Items[selected].Selected = true;
+        list.EndUpdate();
+        refreshingList = false;
+        UpdateButtons();
+        RefreshStates();
+    }
+
+    // 실행 상태만 갱신한다
+    void RefreshStates()
+    {
+        var current = mappings;
+        var running = new List<string>();
         lock (sync)
         {
-            running = playing ?? toggledOn;
-            macro = currentMacro;
+            for (int i = 0; i < current.Length && i < list.Items.Count; i++)
+            {
+                var item = list.Items[i];
+                bool on = current[i].Playing || current[i].ToggledOn;
+                bool usable = current[i].Enabled && macrosById.ContainsKey(current[i].MacroId ?? "");
+                item.UseItemStyleForSubItems = false;
+                foreach (ListViewItem.ListViewSubItem sub in item.SubItems)
+                    sub.ForeColor = usable ? SystemColors.ControlText : SystemColors.GrayText;
+                item.SubItems[4].Text = on ? "● 실행" : current[i].Enabled ? "대기" : "꺼짐";
+                if (on) item.SubItems[4].ForeColor = Color.FromArgb(0, 120, 60);
+                if (on)
+                {
+                    GHubSettings.Macro macro;
+                    running.Add(macrosById.TryGetValue(current[i].MacroId ?? "", out macro) ? macro.Name : KeyName(current[i].Key));
+                }
+            }
         }
-        if (running != null)
+        if (current.Length == 0) ShowStatus("[추가]를 눌러 트리거 키와 매크로를 연결하세요.", false);
+        else if (running.Count > 0) ShowStatus("실행 중: " + string.Join(", ", running), false);
+        else ShowStatus("등록한 키를 누르면 매크로가 실행됩니다. 여러 키를 동시에 눌러도 됩니다.", false);
+    }
+
+    // 체크박스로 사용 여부를 바꿨을 때
+    void OnItemChecked(ListViewItem item)
+    {
+        // 목록 창이 처음 만들어질 때도 이 이벤트가 오므로, 창이 다 뜬 뒤 사용자가 바꾼 것만 처리한다
+        if (refreshingList || !shown) return;
+        var current = mappings;
+        if (item.Index < 0 || item.Index >= current.Length) return;
+        var m = current[item.Index];
+        if (m.Enabled == item.Checked) return;
+        if (!item.Checked)
+            lock (sync) StopMappingLocked(m);   // 끄기 전에 돌고 있던 매크로를 멈춘다
+        m.Enabled = item.Checked;
+        SaveSettings();
+        RefreshStates();
+    }
+
+    void UpdateButtons()
+    {
+        bool any = list.SelectedIndices.Count > 0;
+        editButton.Enabled = any;
+        deleteButton.Enabled = any;
+    }
+
+    static string ModeText(GHubSettings.Mode mode)
+    {
+        switch (mode)
         {
-            stateLabel.Text = "'" + running.Name + "' 실행 중";
-            stateLabel.BackColor = Color.FromArgb(198, 239, 206);
+            case GHubSettings.Mode.Held: return "누르는 동안 반복";
+            case GHubSettings.Mode.Toggle: return "토글";
+            case GHubSettings.Mode.PressRelease: return "누를 때/뗄 때";
+            default: return "한 번 실행";
         }
-        else
+    }
+
+    public static string KeyName(Keys key)
+    {
+        switch (key)
         {
-            stateLabel.Text = macro == null ? "G Hub에 매크로가 없습니다" : "대기 중 - " + trigger + " 키를 누르면 '" + macro.Name + "' 실행";
-            stateLabel.BackColor = SystemColors.Control;
+            case Keys.None: return "(지정 안 됨)";
+            case Keys.LShiftKey: return "왼쪽 Shift";
+            case Keys.RShiftKey: return "오른쪽 Shift";
+            case Keys.LControlKey: return "왼쪽 Ctrl";
+            case Keys.RControlKey: return "오른쪽 Ctrl";
+            case Keys.LMenu: return "왼쪽 Alt";
+            case Keys.RMenu: return "오른쪽 Alt";
         }
+        if (key >= Keys.D0 && key <= Keys.D9) return ((int)(key - Keys.D0)).ToString();
+        if (key >= Keys.NumPad0 && key <= Keys.NumPad9) return "Num " + (int)(key - Keys.NumPad0);
+        return key.ToString();
+    }
+
+    public static bool IsModifier(Keys key)
+    {
+        return key == Keys.LControlKey || key == Keys.RControlKey
+            || key == Keys.LShiftKey || key == Keys.RShiftKey
+            || key == Keys.LMenu || key == Keys.RMenu;
+    }
+
+    // ───────────────────────── 목록 편집 ─────────────────────────
+
+    Mapping SelectedMapping
+    {
+        get
+        {
+            var current = mappings;
+            int i = list.SelectedIndices.Count > 0 ? list.SelectedIndices[0] : -1;
+            return i >= 0 && i < current.Length ? current[i] : null;
+        }
+    }
+
+    void AddMapping()
+    {
+        EditMapping(null);
+    }
+
+    void EditMapping()
+    {
+        var m = SelectedMapping;
+        if (m != null) EditMapping(m);
+    }
+
+    // existing이 null이면 새로 추가한다
+    void EditMapping(Mapping existing)
+    {
+        if (apps.Count == 0)
+        {
+            MessageBox.Show("G Hub 매크로가 없습니다. G Hub에서 매크로를 만든 뒤 [새로고침]을 누르세요.", "G Hub Keyboard");
+            return;
+        }
+
+        StopAll();
+        paused = true;
+        try
+        {
+            using (var dialog = new MappingDialog(this, apps, existing, key => mappings.Any(x => x != existing && x.Key == key)))
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                var updated = new Mapping { Key = dialog.Key, AppId = dialog.AppId, MacroId = dialog.MacroId, Enabled = existing == null || existing.Enabled };
+                var next = mappings.ToList();
+                int index = existing == null ? -1 : next.IndexOf(existing);
+                if (index >= 0) next[index] = updated;
+                else next.Add(updated);
+                mappings = next.ToArray();
+                SaveSettings();
+                RefreshList();
+                list.SelectedIndices.Clear();
+                list.Items[index >= 0 ? index : list.Items.Count - 1].Selected = true;
+            }
+        }
+        finally
+        {
+            CancelCapture();
+            paused = false;
+        }
+    }
+
+    void DeleteMapping()
+    {
+        var m = SelectedMapping;
+        if (m == null) return;
+        StopAll();
+        mappings = mappings.Where(x => x != m).ToArray();
+        SaveSettings();
+        RefreshList();
     }
 
     // ───────────────────────── 매크로 실행 ─────────────────────────
     // 키 감지 스레드와 화면 스레드 양쪽에서 호출된다.
 
-    void TriggerDown(IntPtr device)
+    Mapping FindMapping(Keys key)
     {
+        foreach (var m in mappings)
+            if (m.Key == key && m.Enabled) return m;
+        return null;
+    }
+
+    // 이 키를 후킹으로 처리할지 (입력을 막는 경우). 아니면 장치를 구분할 수 있는 Raw Input으로 처리한다.
+    bool UsesHook(Keys key)
+    {
+        return suppress && !IsModifier(key);
+    }
+
+    void TriggerDown(Mapping m, IntPtr device)
+    {
+        GHubSettings.Macro macro;
+        if (!macrosById.TryGetValue(m.MacroId ?? "", out macro)) return;
         bool sent;
         lock (sync)
         {
-            if (held || currentMacro == null) return;
-            held = true;
-            heldDevice = device;
-            sent = agent.PlayMacro(currentMacro.Id, true);
+            if (m.Held) return;   // 키를 누르고 있으면 반복 입력이 들어오므로 무시
+            m.Held = true;
+            m.HeldDevice = device;
+            sent = agent.PlayMacro(macro.Id, m.TriggerId, true);
             if (sent)
             {
-                playing = currentMacro;
-                if (currentMacro.Mode == GHubSettings.Mode.Toggle)
-                    toggledOn = toggledOn == null ? currentMacro : null;
+                m.Playing = true;
+                if (macro.Mode == GHubSettings.Mode.Toggle) m.ToggledOn = !m.ToggledOn;
             }
         }
-        if (sent) Ui(UpdateState);
-        else Ui(() =>
-        {
-            stateLabel.Text = "G Hub에 연결되지 않아 실행할 수 없습니다";
-            stateLabel.BackColor = Color.FromArgb(255, 222, 200);
-        });
+        if (sent) Ui(RefreshStates);
+        else Ui(() => ShowStatus("G Hub에 연결되지 않아 실행할 수 없습니다.", true));
     }
 
-    void TriggerUp(IntPtr device)
+    void TriggerUp(Mapping m, IntPtr device)
     {
         lock (sync)
         {
-            if (!held || device != heldDevice) return;
-            held = false;
-            if (playing == null) return;
-            agent.PlayMacro(playing.Id, false);
-            playing = null;
+            if (!m.Held || device != m.HeldDevice) return;
+            m.Held = false;
+            if (!m.Playing) return;
+            agent.PlayMacro(m.MacroId, m.TriggerId, false);
+            m.Playing = false;
         }
-        Ui(UpdateState);
+        Ui(RefreshStates);
     }
 
-    void ReleaseTrigger()
+    // 실행 중인 매크로를 모두 멈춘다. 켜져 있는 토글형 매크로는 한 번 더 눌러서 끈다.
+    void StopAll()
     {
         lock (sync)
         {
-            if (!held) return;
-            TriggerUp(heldDevice);
+            foreach (var m in mappings) StopMappingLocked(m);
         }
+        if (IsHandleCreated) Ui(RefreshStates);
     }
 
-    // 토글형 매크로가 켜진 채로 남지 않게 한 번 더 눌러서 끈다
-    void TurnOffToggle()
+    // sync를 잡은 상태에서 호출한다
+    void StopMappingLocked(Mapping m)
     {
-        lock (sync)
+        if (m.Held)
         {
-            if (toggledOn == null) return;
-            agent.PlayMacro(toggledOn.Id, true);
-            agent.PlayMacro(toggledOn.Id, false);
-            toggledOn = null;
+            m.Held = false;
+            if (m.Playing) agent.PlayMacro(m.MacroId, m.TriggerId, false);
+            m.Playing = false;
         }
-        Ui(UpdateState);
+        if (m.ToggledOn)
+        {
+            agent.PlayMacro(m.MacroId, m.TriggerId, true);
+            agent.PlayMacro(m.MacroId, m.TriggerId, false);
+            m.ToggledOn = false;
+        }
     }
 
     void ResetPlayback()
     {
         lock (sync)
         {
-            held = false;
-            playing = null;
-            toggledOn = null;
+            foreach (var m in mappings)
+            {
+                m.Held = false;
+                m.Playing = false;
+                m.ToggledOn = false;
+            }
         }
     }
 
@@ -758,21 +923,23 @@ class MainForm : Form
         {
             var info = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
             bool injected = (info.flags & LLKHF_INJECTED) != 0;
-            // 다른 프로그램이 보낸 가상 입력은 무시. 키 변경 중에는 아무 키도 막지 않는다.
-            if (!injected && !capturing)
+            // 다른 프로그램이 보낸 가상 입력은 무시. 키 변경·목록 편집 중에는 아무 키도 막지 않는다.
+            if (!injected && !capturing && !paused)
             {
                 int msg = wParam.ToInt32();
                 bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
                 bool up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
                 var key = (Keys)info.vkCode;
 
-                // 입력을 막는 경우에만 후킹으로 처리한다.
-                // 막지 않는 경우에는 장치를 구분할 수 있는 Raw Input(WndProc)에서 처리한다.
-                if (suppress && key == trigger)
+                if (UsesHook(key))
                 {
-                    if (down) TriggerDown(IntPtr.Zero);
-                    else if (up) TriggerUp(IntPtr.Zero);
-                    return (IntPtr)1;
+                    var m = FindMapping(key);
+                    if (m != null)
+                    {
+                        if (down) TriggerDown(m, IntPtr.Zero);
+                        else if (up) TriggerUp(m, IntPtr.Zero);
+                        return (IntPtr)1;
+                    }
                 }
             }
         }
@@ -787,11 +954,11 @@ class MainForm : Form
             MessageBox.Show("Raw Input 등록에 실패했습니다. (오류 " + Marshal.GetLastWin32Error() + ")", "G Hub Keyboard");
     }
 
-    // 키 변경은 Raw Input으로 받는다.
-    // 이 창이 맨 앞에 있으면 (Raw Input을 등록한 탓에) 키보드 후킹이 호출되지 않기 때문이다.
+    // 입력을 막지 않는 키와 키 변경은 Raw Input으로 받는다.
+    // (이 프로그램의 창이 맨 앞에 있으면 Raw Input을 등록한 탓에 키보드 후킹이 호출되지 않는다)
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == WM_INPUT && (capturing || !suppress))
+        if (m.Msg == WM_INPUT)
             HandleRawInput(m.LParam);
         else if (m.Msg == WM_INPUT_DEVICE_CHANGE)
             isGHubDevice.Clear();   // 장치를 뽑았다 꽂으면 핸들이 재사용될 수 있으므로 다시 확인한다
@@ -823,8 +990,7 @@ class MainForm : Form
             ushort vkey = (ushort)Marshal.ReadInt16(buffer, offset + 6);
 
             // 다른 프로그램이 보낸 입력(device 0)과 G Hub 매크로 입력은 무시
-            bool fromKeyboard = device != IntPtr.Zero && !IsGHubDevice(device);
-            if (!fromKeyboard) return;
+            if (device == IntPtr.Zero || IsGHubDevice(device)) return;
             var key = NormalizeKey(vkey, makeCode, flags);
             bool up = (flags & RI_KEY_BREAK) != 0;
 
@@ -833,10 +999,12 @@ class MainForm : Form
                 if (!up) FinishCapture(key);
                 return;
             }
+            if (paused || UsesHook(key)) return;
 
-            if (key != trigger) return;
-            if (!up) TriggerDown(device);
-            else TriggerUp(device);
+            var mapping = FindMapping(key);
+            if (mapping == null) return;
+            if (!up) TriggerDown(mapping, device);
+            else TriggerUp(mapping, device);
         }
         finally
         {
@@ -870,25 +1038,25 @@ class MainForm : Form
         }
     }
 
-    void StartCapture()
+    // 다음에 누르는 키를 callback으로 넘긴다. Esc를 누르면 Keys.Escape가 넘어간다.
+    public void BeginCapture(Action<Keys> callback)
     {
-        ReleaseTrigger();
-        ActiveControl = null;   // 누른 키가 버튼이나 목록에 전달되지 않게 포커스를 뺀다
+        captureCallback = callback;
         capturing = true;
-        keyLabel.Text = "새 키를 누르세요 (Esc: 취소)";
+    }
+
+    public void CancelCapture()
+    {
+        capturing = false;
+        captureCallback = null;
     }
 
     void FinishCapture(Keys key)
     {
         if (!capturing) return;
-        capturing = false;
-        if (key != Keys.Escape)
-        {
-            trigger = key;
-            SaveSettings();
-        }
-        UpdateKeyLabel();
-        UpdateState();
+        var callback = captureCallback;
+        CancelCapture();
+        if (callback != null) callback(key);
     }
 
     void Ui(Action action)
@@ -901,8 +1069,11 @@ class MainForm : Form
 
     // 설정은 레지스트리(HKCU\Software\GHubKeyboard)에 저장한다.
     // 관리자 권한으로 사용자 폴더에 파일을 쓰면 링크/정션을 이용한 임의 파일 쓰기에 악용될 수 있기 때문이다.
+    // 매핑은 "키|게임 프로필 ID|매크로 ID|사용 여부(1/0)" 형식의 여러 줄 문자열로 저장한다.
     void LoadSettings()
     {
+        var legacy = new Dictionary<string, string>();
+        var loaded = new List<Mapping>();
         try
         {
             using (var reg = Registry.CurrentUser.OpenSubKey(SettingsKey))
@@ -910,47 +1081,74 @@ class MainForm : Form
                 if (reg != null)
                 {
                     foreach (var name in reg.GetValueNames())
-                        ApplySetting(name, reg.GetValue(name) as string);
-                    return;
+                    {
+                        if (name == "mappings")
+                        {
+                            var lines = reg.GetValue(name) as string[];
+                            if (lines != null)
+                                foreach (var line in lines)
+                                {
+                                    var m = ParseMapping(line);
+                                    if (m != null && !loaded.Any(x => x.Key == m.Key)) loaded.Add(m);
+                                }
+                        }
+                        else
+                        {
+                            var value = reg.GetValue(name) as string;
+                            if (value != null) legacy[name] = value;
+                        }
+                    }
                 }
-            }
-            // 예전 버전의 설정 파일이 있으면 한 번 읽어 온다 (읽기만 한다)
-            if (!File.Exists(legacySettingsPath)) return;
-            foreach (var line in File.ReadAllLines(legacySettingsPath, Encoding.UTF8))
-            {
-                var parts = line.Split(new[] { '=' }, 2);
-                if (parts.Length == 2) ApplySetting(parts[0], parts[1]);
+                else if (File.Exists(legacySettingsPath))
+                {
+                    // v1.0.0 이전의 설정 파일이 있으면 한 번 읽어 온다 (읽기만 한다)
+                    foreach (var line in File.ReadAllLines(legacySettingsPath, Encoding.UTF8))
+                    {
+                        var parts = line.Split(new[] { '=' }, 2);
+                        if (parts.Length == 2) legacy[parts[0]] = parts[1];
+                    }
+                }
             }
         }
         catch { }
+
+        string value2;
+        if (legacy.TryGetValue("suppress", out value2)) suppress = value2 == "1";
+        if (legacy.TryGetValue("updateCheck", out value2)) checkUpdates = value2 == "1";
+
+        // v1.0.0의 키 하나짜리 설정은 목록의 첫 줄로 옮긴다
+        Keys oldKey;
+        string oldMacro, oldApp;
+        if (loaded.Count == 0 && legacy.TryGetValue("macroId", out oldMacro) && !string.IsNullOrEmpty(oldMacro)
+            && legacy.TryGetValue("key", out value2) && Enum.TryParse(value2, out oldKey))
+        {
+            legacy.TryGetValue("app", out oldApp);
+            loaded.Add(new Mapping { Key = oldKey, AppId = oldApp, MacroId = oldMacro });
+        }
+        mappings = loaded.ToArray();
     }
 
-    void ApplySetting(string key, string value)
+    static Mapping ParseMapping(string line)
     {
-        if (value == null) return;
-        if (key == "key")
-        {
-            Keys k;
-            if (Enum.TryParse(value, out k)) trigger = k;
-        }
-        else if (key == "suppress") suppress = value == "1";
-        else if (key == "updateCheck") checkUpdates = value == "1";
-        else if (key == "app") selectedAppId = value;
-        else if (key == "macroId") selectedMacroId = value;
+        if (string.IsNullOrEmpty(line)) return null;
+        var parts = line.Split('|');
+        Keys key;
+        if (parts.Length < 3 || !Enum.TryParse(parts[0], out key) || key == Keys.None || string.IsNullOrEmpty(parts[2])) return null;
+        return new Mapping { Key = key, AppId = parts[1], MacroId = parts[2], Enabled = parts.Length < 4 || parts[3] != "0" };
     }
 
     void SaveSettings()
     {
-        if (loadingUi) return;
         try
         {
             using (var reg = Registry.CurrentUser.CreateSubKey(SettingsKey))
             {
-                reg.SetValue("key", trigger.ToString());
+                reg.SetValue("mappings", mappings.Select(m => m.Key + "|" + m.AppId + "|" + m.MacroId + "|" + (m.Enabled ? "1" : "0")).ToArray(), RegistryValueKind.MultiString);
                 reg.SetValue("suppress", suppress ? "1" : "0");
                 reg.SetValue("updateCheck", checkUpdates ? "1" : "0");
-                reg.SetValue("app", selectedAppId ?? "");
-                reg.SetValue("macroId", selectedMacroId ?? "");
+                // v1.0.0의 키 하나짜리 설정은 목록으로 옮겼으므로 지운다
+                foreach (var old in new[] { "key", "app", "macroId" })
+                    reg.DeleteValue(old, false);
             }
         }
         catch { }
@@ -960,12 +1158,159 @@ class MainForm : Form
     {
         // 매크로가 켜진 채로 남지 않게 정리하고, 전송될 시간을 잠깐 준다
         bool pending;
-        lock (sync) pending = playing != null || toggledOn != null;
-        ReleaseTrigger();
-        TurnOffToggle();
+        lock (sync) pending = mappings.Any(m => m.Playing || m.ToggledOn);
+        StopAll();
         if (pending) Thread.Sleep(300);
         agent.Stop();
         if (hookThreadId != 0) PostThreadMessage(hookThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         base.OnFormClosing(e);
+    }
+}
+
+// 트리거 키와 매크로를 고르는 창
+class MappingDialog : Form
+{
+    readonly MainForm owner;
+    readonly Func<Keys, bool> keyInUse;
+    ComboBox appBox, macroBox;
+    Label modeLabel, keyLabel;
+
+    public Keys Key { get; private set; }
+    public string AppId { get; private set; }
+    public string MacroId { get; private set; }
+
+    public MappingDialog(MainForm owner, List<GHubSettings.App> apps, Mapping existing, Func<Keys, bool> keyInUse)
+    {
+        this.owner = owner;
+        this.keyInUse = keyInUse;
+        Key = existing != null ? existing.Key : Keys.None;
+
+        Text = existing == null ? "매크로 추가" : "매크로 수정";
+        Font = owner.Font;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.CenterParent;
+        ClientSize = new Size(400, 230);
+
+        Controls.Add(new Label { Text = "게임 프로필", Location = new Point(20, 22), AutoSize = true });
+        appBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(110, 18), Size = new Size(270, 28) };
+        foreach (var app in apps) appBox.Items.Add(app);
+        appBox.SelectedIndexChanged += (s, e) => FillMacros(null);
+        Controls.Add(appBox);
+
+        Controls.Add(new Label { Text = "매크로", Location = new Point(20, 58), AutoSize = true });
+        macroBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(110, 54), Size = new Size(270, 28) };
+        macroBox.SelectedIndexChanged += (s, e) => UpdateMode();
+        Controls.Add(macroBox);
+
+        modeLabel = new Label { Location = new Point(110, 86), AutoSize = true, ForeColor = SystemColors.GrayText };
+        Controls.Add(modeLabel);
+
+        keyLabel = new Label { Location = new Point(20, 124), AutoSize = true, Font = new Font(owner.Font.FontFamily, 12f, FontStyle.Bold) };
+        Controls.Add(keyLabel);
+        var keyButton = new Button { Text = "키 지정", Location = new Point(270, 119), Size = new Size(110, 32) };
+        keyButton.Click += (s, e) => StartCapture();
+        Controls.Add(keyButton);
+
+        var okButton = new Button { Text = "확인", Location = new Point(214, 180), Size = new Size(80, 32) };
+        okButton.Click += (s, e) => Confirm();
+        Controls.Add(okButton);
+        var cancelButton = new Button { Text = "취소", Location = new Point(300, 180), Size = new Size(80, 32), DialogResult = DialogResult.Cancel };
+        Controls.Add(cancelButton);
+        CancelButton = cancelButton;
+
+        // 기존 매핑의 게임 프로필/매크로를 선택해 둔다
+        GHubSettings.App selectedApp = null;
+        if (existing != null)
+            selectedApp = apps.FirstOrDefault(a => a.Macros.Any(m => m.Id == existing.MacroId))
+                       ?? apps.FirstOrDefault(a => a.Id == existing.AppId);
+        appBox.SelectedItem = selectedApp ?? apps.FirstOrDefault();
+        FillMacros(existing != null ? existing.MacroId : null);
+        UpdateKeyLabel();
+    }
+
+    void FillMacros(string selectId)
+    {
+        var app = appBox.SelectedItem as GHubSettings.App;
+        macroBox.Items.Clear();
+        if (app == null) return;
+        foreach (var m in app.Macros) macroBox.Items.Add(m);
+        var macro = app.Macros.FirstOrDefault(m => m.Id == selectId) ?? app.Macros.FirstOrDefault();
+        if (macro != null) macroBox.SelectedItem = macro;
+        UpdateMode();
+    }
+
+    void UpdateMode()
+    {
+        var macro = macroBox.SelectedItem as GHubSettings.Macro;
+        if (macro == null) { modeLabel.Text = ""; return; }
+        switch (macro.Mode)
+        {
+            case GHubSettings.Mode.Held: modeLabel.Text = "종류: 누르고 있는 동안 반복"; break;
+            case GHubSettings.Mode.Toggle: modeLabel.Text = "종류: 토글 (한 번 누르면 켜지고, 다시 누르면 꺼짐)"; break;
+            case GHubSettings.Mode.PressRelease: modeLabel.Text = "종류: 누를 때 / 뗄 때 실행"; break;
+            default: modeLabel.Text = "종류: 한 번 실행"; break;
+        }
+    }
+
+    void UpdateKeyLabel()
+    {
+        keyLabel.Text = "트리거 키: " + MainForm.KeyName(Key);
+    }
+
+    void StartCapture()
+    {
+        ActiveControl = null;   // 누른 키가 버튼이나 목록에 전달되지 않게 포커스를 뺀다
+        keyLabel.Text = "새 키를 누르세요 (Esc: 취소)";
+        owner.BeginCapture(key =>
+        {
+            if (key != Keys.Escape)
+            {
+                if (keyInUse(key))
+                    MessageBox.Show(this, MainForm.KeyName(key) + " 키는 이미 다른 매크로에 쓰고 있습니다.", "G Hub Keyboard");
+                else
+                    Key = key;
+            }
+            UpdateKeyLabel();
+        });
+    }
+
+    void Confirm()
+    {
+        var app = appBox.SelectedItem as GHubSettings.App;
+        var macro = macroBox.SelectedItem as GHubSettings.Macro;
+        if (macro == null)
+        {
+            MessageBox.Show(this, "매크로를 고르세요.", "G Hub Keyboard");
+            return;
+        }
+        if (Key == Keys.None)
+        {
+            MessageBox.Show(this, "[키 지정]을 눌러 트리거 키를 정하세요.", "G Hub Keyboard");
+            return;
+        }
+        if (keyInUse(Key))
+        {
+            MessageBox.Show(this, MainForm.KeyName(Key) + " 키는 이미 다른 매크로에 쓰고 있습니다.", "G Hub Keyboard");
+            return;
+        }
+        AppId = app != null ? app.Id : "";
+        MacroId = macro.Id;
+        DialogResult = DialogResult.OK;
+    }
+
+    // 키를 기다리는 동안에는 이 창의 버튼/목록이 키 입력에 반응하지 않게 한다
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (owner.Capturing) return true;
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        owner.CancelCapture();
+        base.OnFormClosed(e);
     }
 }
